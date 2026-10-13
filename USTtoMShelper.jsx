@@ -1182,13 +1182,16 @@
         var shortNotes = 0;
 
         if (notes.length === 0 || totalSeconds <= 0) {
-            throw new Error("UST 中没有可用于生成口型的有效音符。 ");
+            throw new Error("UST 中没有可用于生成口型的有效音符。");
         }
+
         if (requiredOutPoint > parentComp.duration + tiny) {
-            throw new Error(
+            warnings.push(
                 "当前合成时长不足以容纳这份 UST。\n" +
-                "需要结束于 " + requiredOutPoint.toFixed(3) + " 秒，当前合成结束于 " +
-                parentComp.duration.toFixed(3) + " 秒。\n请先延长外层合成，再应用口型。"
+                "需要结束于 " + requiredOutPoint.toFixed(3) +
+                " 秒，当前合成结束于 " +
+                parentComp.duration.toFixed(3) + " 秒。\n" +
+                "\n超出合成范围的口型不会被生成。"
             );
         }
 
