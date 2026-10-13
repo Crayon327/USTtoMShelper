@@ -3,7 +3,7 @@
 
 /*
  * USTtoMShelper - 口型样板、UST 解析与时间重映射
- * v0.9.0
+ * v0.9.6
  * 创建 7 秒口型样板，解析 UST/USTX，并根据所选轨道的日语元音生成时间重映射。
  */
 
@@ -21,6 +21,25 @@
 
     function trimText(value) {
         return String(value).replace(/^\s+|\s+$/g, "");
+    }
+
+    function getDisplayFileName(file) {
+        var displayName = "";
+        var encodedName = "";
+        try {
+            displayName = String(file.displayName || "");
+        } catch (displayNameError) {
+            displayName = "";
+        }
+        if (displayName && !/%[0-9A-Fa-f]{2}/.test(displayName)) {
+            return displayName;
+        }
+        try {
+            encodedName = String(file.name || "");
+            return File.decode(encodedName);
+        } catch (decodeFileNameError) {
+            return displayName || encodedName || String(file.name || "");
+        }
     }
 
     function isValidDimension(value) {
@@ -71,7 +90,44 @@
     }
 
     // UST 文件读取 
-    // 读取编码
+    function isValidUTF8Binary(rawText) {
+        var i = 0, c, c2, c3, c4, hasMultibyte = false;
+        while (i < rawText.length) {
+            c = rawText.charCodeAt(i) & 255;
+            if (c <= 0x7F) {
+                i++;
+                continue;
+            }
+            hasMultibyte = true;
+            if (c >= 0xC2 && c <= 0xDF) {
+                if (i + 1 >= rawText.length) { return false; }
+                c2 = rawText.charCodeAt(i + 1) & 255;
+                if (c2 < 0x80 || c2 > 0xBF) { return false; }
+                i += 2;
+            } else if (c >= 0xE0 && c <= 0xEF) {
+                if (i + 2 >= rawText.length) { return false; }
+                c2 = rawText.charCodeAt(i + 1) & 255;
+                c3 = rawText.charCodeAt(i + 2) & 255;
+                if (c2 < 0x80 || c2 > 0xBF || c3 < 0x80 || c3 > 0xBF) { return false; }
+                if (c === 0xE0 && c2 < 0xA0) { return false; }
+                if (c === 0xED && c2 > 0x9F) { return false; }
+                i += 3;
+            } else if (c >= 0xF0 && c <= 0xF4) {
+                if (i + 3 >= rawText.length) { return false; }
+                c2 = rawText.charCodeAt(i + 1) & 255;
+                c3 = rawText.charCodeAt(i + 2) & 255;
+                c4 = rawText.charCodeAt(i + 3) & 255;
+                if (c2 < 0x80 || c2 > 0xBF || c3 < 0x80 || c3 > 0xBF || c4 < 0x80 || c4 > 0xBF) { return false; }
+                if (c === 0xF0 && c2 < 0x90) { return false; }
+                if (c === 0xF4 && c2 > 0x8F) { return false; }
+                i += 4;
+            } else {
+                return false;
+            }
+        }
+        return hasMultibyte;
+    }
+
     function detectUSTEncoding(rawText, encodingMode) {
         if (encodingMode === 1) {
             return "UTF-8";
@@ -91,7 +147,10 @@
         if (/Charset\s*=\s*["']?(Shift[_-]?JIS|SJIS)/i.test(header)) {
             return "Shift_JIS";
         }
-
+        // 部分 UST 以 UTF-8 保存但未声明 Charset；合法的多字节 UTF-8 优先按 UTF-8 读取。
+        if (isValidUTF8Binary(rawText)) {
+            return "UTF-8";
+        }
         return "Shift_JIS";
     }
 
@@ -142,7 +201,8 @@
         return ch;
     }
 
-    // 判断歌词是否以元音直接起始
+    // 判断歌词是否以元音直接起始；这种音符可与前一个相同元音连续维持。
+    // 含有辅音起始的假名（如 ら、だ）不会通过此判断。
     function isOnsetlessLyric(lyric) {
         var original = trimText(lyric);
         var i, normalized = "", ch;
@@ -161,7 +221,7 @@
         return /^[あいうえおぁぃぅぇぉー]+$/.test(normalized);
     }
 
-    // 将歌词归类为 a/i/u/e/o、closed 或 unknown
+    // 将歌词归类为 a/i/u/e/o、closed 或 unknown。
     function classifyLyric(lyric, previousVowel) {
         var original = trimText(lyric);
         var lower = original.toLowerCase();
@@ -851,7 +911,7 @@
                 rawNotes.push({
                     startTick: startTick,
                     endTick: endTick,
-                    lyric: partNotes.lyric === undefined ? "" : String(partNotes.lyric),
+                    lyric: (partNotes.lyric === undefined ? "" : String(partNotes.lyric)),
                     tone: partNotes.tone === undefined ? "" : partNotes.tone,
                     section: (part.name || ("声部" + (partIndex + 1))) + "#" + (noteIndex + 1),
                     partIndex: partIndex,
@@ -1132,6 +1192,17 @@
         return /^[aiueo]$/.test(note.vowel);
     }
 
+    function canMergeContinuousSameVowel(current, next, epsilon) {
+        return current !== null && current !== undefined && next !== null && next !== undefined &&
+            isVowelEvent(current) && isVowelEvent(next) &&
+            current.vowel === next.vowel &&
+            !current.isGap && !next.isGap &&
+            !next.startsAfterGap &&
+            next.onsetless === true &&
+            current.kind !== "sokuon" && next.kind !== "sokuon" &&
+            Math.abs(current.endSeconds - next.startSeconds) <= epsilon;
+    }
+
     // 仅合并后一个音符无辅音起始、时间连续且元音相同的音符
     function mergeContinuousSameVowelNotes(notes) {
         var merged = [];
@@ -1148,14 +1219,7 @@
             }
 
             current = merged.length > 0 ? merged[merged.length - 1] : null;
-            isContinuous = current !== null &&
-                isVowelEvent(current) && isVowelEvent(copy) &&
-                current.vowel === copy.vowel &&
-                !current.isGap && !copy.isGap &&
-                !copy.startsAfterGap &&
-                copy.onsetless === true &&
-                current.kind !== "sokuon" && copy.kind !== "sokuon" &&
-                Math.abs(current.endSeconds - copy.startSeconds) <= epsilon;
+            isContinuous = canMergeContinuousSameVowel(current, copy, epsilon);
 
             if (isContinuous) {
                 if (!current.sameVowelBoundaries) {
@@ -1188,7 +1252,20 @@
     }
 
     // 将 UST 音符转换为外层合成时间与样板源时间之间的关键帧
-    function buildTimeRemapPlan(parseResult, layer, parentComp, markerMap) {
+    function buildTimeRemapPlan(parseResult, layer, parentComp, markerMap, timingSettings) {
+        timingSettings = timingSettings || {};
+        var openPercent = Number(timingSettings.openPercent);
+        var closePercent = Number(timingSettings.closePercent);
+        var timeOffset = Number(timingSettings.timeOffset);
+        if (isNaN(openPercent)) { openPercent = 100; }
+        if (isNaN(closePercent)) { closePercent = 100; }
+        if (isNaN(timeOffset)) { timeOffset = 0; }
+        openPercent = Math.max(0, Math.min(100, openPercent));
+        closePercent = Math.max(0, Math.min(100, closePercent));
+        timeOffset = Math.max(-1, Math.min(1, timeOffset));
+        // 开口/闭口时间以样板内 0.5 秒为基准，百分比换算为外层合成中的转场时长。
+        var openDuration = 0.5 * openPercent / 100.0;
+        var closeDuration = 0.5 * closePercent / 100.0;
         var notes = mergeContinuousSameVowelNotes(parseResult.notes);
         var keys = [];
         var warnings = [];
@@ -1198,7 +1275,7 @@
         var requiredOutPoint = baseInPoint + totalSeconds;
         var i, note, nextNote, vowel, sourceBase, sourceStart, sourceHold, sourceEnd;
         var noteStart, noteEnd, noteDuration, endKeyTime, trimsOutgoing;
-        var inDistance, outDistance, transitionIn, transitionOut;
+        var transitionIn, transitionOut;
         var holdStartTime, holdEndTime, midpoint;
         var firstSameVowelBoundary, lastSameVowelBoundary, availableIn, availableOut;
         var tiny = 0.000001;
@@ -1256,28 +1333,37 @@
 
             if (isVowelEvent(note)) {
                 noteDuration = endKeyTime - noteStart;
-                inDistance = Math.max(0, sourceHold - sourceStart);
-                outDistance = Math.max(0, sourceEnd - sourceHold);
                 if (note.sameVowelBoundaries && note.sameVowelBoundaries.length > 0) {
                     firstSameVowelBoundary = baseInPoint + note.sameVowelBoundaries[0];
                     lastSameVowelBoundary = baseInPoint + note.sameVowelBoundaries[note.sameVowelBoundaries.length - 1];
                     availableIn = Math.max(0, (firstSameVowelBoundary - noteStart) / 2.0);
                     availableOut = Math.max(0, (endKeyTime - lastSameVowelBoundary) / 2.0);
-                    transitionIn = Math.min(inDistance, availableIn);
-                    transitionOut = Math.min(outDistance, availableOut);
+                    transitionIn = Math.min(openDuration, availableIn);
+                    transitionOut = Math.min(closeDuration, availableOut);
                 } else {
-                    transitionIn = Math.min(inDistance, noteDuration / 2.0);
-                    transitionOut = Math.min(outDistance, noteDuration / 2.0);
+                    transitionIn = Math.min(openDuration, noteDuration / 2.0);
+                    transitionOut = Math.min(closeDuration, noteDuration / 2.0);
                 }
                 holdStartTime = noteStart + transitionIn;
                 holdEndTime = endKeyTime - transitionOut;
 
                 if (holdStartTime > holdEndTime) {
                     midpoint = (noteStart + endKeyTime) / 2.0;
-                    appendRemapKey(keys, midpoint, sourceHold, "vowel-hold");
+                    appendRemapKey(
+                        keys, midpoint, sourceHold,
+                        transitionOut <= tiny ? "vowel-hold-zero-close" : "vowel-hold"
+                    );
                 } else {
-                    appendRemapKey(keys, holdStartTime, sourceHold, "vowel-hold-in");
-                    appendRemapKey(keys, holdEndTime, sourceHold, "vowel-hold-out");
+                    // 闭口时间为 0 时，不添加与出点同一时刻的 hold 关键帧。
+                    // 否则同一时刻的 note-end 会覆盖 hold 值，AE 便会从前一关键帧线性插值，
+                    // 导致闭口动画被错误地拉长到整个剩余音符时长。
+                    appendRemapKey(
+                        keys, holdStartTime, sourceHold,
+                        transitionOut <= tiny ? "vowel-hold-zero-close" : "vowel-hold-in"
+                    );
+                    if (transitionOut > tiny) {
+                        appendRemapKey(keys, holdEndTime, sourceHold, "vowel-hold-out");
+                    }
                 }
                 appendRemapKey(keys, endKeyTime, sourceEnd, "note-end");
             } else {
@@ -1292,6 +1378,12 @@
             }
         }
 
+        // 整体偏移只作用于关键帧时间；负值提前，正值延后，不改变源合成取样时间。
+        if (Math.abs(timeOffset) > tiny) {
+            for (i = 0; i < keys.length; i++) {
+                keys[i].time += timeOffset;
+            }
+        }
         keys.sort(function (a, b) { return a.time - b.time; });
         if (shortNotes > 0) {
             warnings.push(shortNotes + " 个音符短于外层合成的一帧，渲染结果可能无法完整呈现每次口型变化。");
@@ -1306,7 +1398,7 @@
     }
 
     // 将计算结果写入时间重映射
-    function applyTimeRemapToSelectedLayer(parseResult) {
+    function applyTimeRemapToSelectedLayer(parseResult, timingSettings) {
         if (!app.project) {
             throw new Error("当前没有打开的 After Effects 工程。");
         }
@@ -1324,7 +1416,7 @@
         }
         // 视频素材与合成图层均可应用；来源没有样板标记时采用默认时间布局。
         var markerMap = getTemplateMarkerMap(layer.source);
-        var plan = buildTimeRemapPlan(parseResult, layer, parentComp, markerMap);
+        var plan = buildTimeRemapPlan(parseResult, layer, parentComp, markerMap, timingSettings);
 
         if (layer.timeRemapEnabled && !confirm(
             "所选图层已启用时间重映射。\n继续将替换该图层现有的时间重映射关键帧。\n\n是否继续？"
@@ -1381,7 +1473,8 @@
 
                 outgoingInterpolation = KeyframeInterpolationType.LINEAR;
                 if (planKey && (planKey.sourceLabel === "note-end" ||
-                    planKey.sourceLabel === "closed-note-end")) {
+                    planKey.sourceLabel === "closed-note-end" ||
+                    planKey.sourceLabel === "vowel-hold-zero-close")) {
                     outgoingInterpolation = KeyframeInterpolationType.HOLD;
                 }
 
@@ -1404,20 +1497,97 @@
         return Number(value).toFixed(6);
     }
 
-    function writeEventTSV(outputFile, result) {
+    // 计算 TSV 中每个元音段可用的开口/闭口转场时长。
+    // 连续同元音合并组只在组首记录开口时长，只在组尾记录闭口时长。
+    function buildTSVTransitionLimits(result, openTargetSeconds, closeTargetSeconds) {
+        var limits = [];
+        var groupsByTrack = {};
+        var i, note, trackKey, groupList;
+        for (i = 0; i < result.notes.length; i++) {
+            note = result.notes[i];
+            limits.push({ openSeconds: 0, closeSeconds: 0 });
+            trackKey = (result.format === "ustx" && note.trackNo !== undefined)
+                ? "track_" + note.trackNo : "single_track";
+            if (!groupsByTrack[trackKey]) {
+                groupsByTrack[trackKey] = [];
+            }
+            groupsByTrack[trackKey].push({ note: note, rowIndex: i });
+        }
+
+        for (trackKey in groupsByTrack) {
+            if (!groupsByTrack.hasOwnProperty(trackKey)) {
+                continue;
+            }
+            groupList = groupsByTrack[trackKey];
+            groupList.sort(function (a, b) {
+                return a.note.startSeconds - b.note.startSeconds;
+            });
+
+            var group = null;
+            var j, entry, previousEntry, firstEntry, lastEntry;
+            function flushGroup() {
+                if (!group || group.length === 0) {
+                    return;
+                }
+                firstEntry = group[0];
+                lastEntry = group[group.length - 1];
+                if (isVowelEvent(firstEntry.note)) {
+                    var openAvailable = group.length > 1
+                        ? Math.max(0, group[1].note.startSeconds - firstEntry.note.startSeconds)
+                        : Math.max(0, firstEntry.note.endSeconds - firstEntry.note.startSeconds);
+                    var closeAvailable = Math.max(0, lastEntry.note.endSeconds - lastEntry.note.startSeconds);
+                    limits[firstEntry.rowIndex].openSeconds = Math.min(openTargetSeconds, openAvailable / 2.0);
+                    limits[lastEntry.rowIndex].closeSeconds = Math.min(closeTargetSeconds, closeAvailable / 2.0);
+                }
+                group = null;
+            }
+
+            for (j = 0; j < groupList.length; j++) {
+                entry = groupList[j];
+                previousEntry = group && group.length > 0 ? group[group.length - 1] : null;
+                if (previousEntry && canMergeContinuousSameVowel(previousEntry.note, entry.note, 0.000001)) {
+                    group.push(entry);
+                } else {
+                    flushGroup();
+                    group = [entry];
+                }
+            }
+            flushGroup();
+        }
+        return limits;
+    }
+
+    function writeEventTSV(outputFile, result, timingSettings) {
+        timingSettings = timingSettings || {};
+        var openPercent = Number(timingSettings.openPercent);
+        var closePercent = Number(timingSettings.closePercent);
+        var timeOffset = Number(timingSettings.timeOffset);
+        if (isNaN(openPercent)) { openPercent = 100; }
+        if (isNaN(closePercent)) { closePercent = 100; }
+        if (isNaN(timeOffset)) { timeOffset = 0; }
+        openPercent = Math.max(0, Math.min(100, openPercent));
+        closePercent = Math.max(0, Math.min(100, closePercent));
+        timeOffset = Math.max(-1, Math.min(1, timeOffset));
+        var openTargetSeconds = 0.5 * openPercent / 100.0;
+        var closeTargetSeconds = 0.5 * closePercent / 100.0;
+
         var out = new File(outputFile.fsName);
         out.encoding = "UTF-8";
         if (!out.open("w")) {
             throw new Error("无法创建事件表文件：" + outputFile.fsName);
         }
+        // 添加 UTF-8 BOM，避免部分表格软件将日文歌词误按系统代码页读取。
+        out.write("\uFEFF");
         if (result.format === "ustx") {
-            out.writeln("track_no\ttrack_name\tsinger\tindex\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number");
+            out.writeln("track_no\ttrack_name\tsinger\tindex\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number\topen_percent\tclose_percent\ttime_offset_sec\topen_target_sec\tclose_target_sec\topen_limit_sec\tclose_limit_sec");
         } else {
-            out.writeln("index\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number");
+            out.writeln("index\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number\topen_percent\tclose_percent\ttime_offset_sec\topen_target_sec\tclose_target_sec\topen_limit_sec\tclose_limit_sec");
         }
-        var i, n, row;
+        var transitionLimits = buildTSVTransitionLimits(result, openTargetSeconds, closeTargetSeconds);
+        var i, n, row, limits;
         for (i = 0; i < result.notes.length; i++) {
             n = result.notes[i];
+            limits = transitionLimits[i];
             if (result.format === "ustx") {
                 row = [
                     n.trackNo,
@@ -1434,7 +1604,14 @@
                     tsvCell(n.lyric),
                     n.vowel,
                     n.kind,
-                    tsvCell(n.noteNumber)
+                    tsvCell(n.noteNumber),
+                    tsvNumber(openPercent),
+                    tsvNumber(closePercent),
+                    tsvNumber(timeOffset),
+                    tsvNumber(openTargetSeconds),
+                    tsvNumber(closeTargetSeconds),
+                    tsvNumber(limits.openSeconds),
+                    tsvNumber(limits.closeSeconds)
                 ];
             } else {
                 row = [
@@ -1449,7 +1626,14 @@
                     tsvCell(n.lyric),
                     n.vowel,
                     n.kind,
-                    tsvCell(n.noteNumber)
+                    tsvCell(n.noteNumber),
+                    tsvNumber(openPercent),
+                    tsvNumber(closePercent),
+                    tsvNumber(timeOffset),
+                    tsvNumber(openTargetSeconds),
+                    tsvNumber(closeTargetSeconds),
+                    tsvNumber(limits.openSeconds),
+                    tsvNumber(limits.closeSeconds)
                 ];
             }
             out.writeln(row.join("\t"));
@@ -1553,17 +1737,9 @@
             }
         };
 
-        var fixedInfo = sizePanel.add("statictext", undefined,
-            "时长：7 秒     帧率：30 fps     元音动画段：各 1 秒");
-        fixedInfo.helpTip = "固定参数保证后续 UST 时间重映射使用一致的标记位置。";
-        sizePanel.add("statictext", undefined, "o 动画结束后 0.5 秒进入闭口状态。");
-
         var createButton = templateTab.add("button", undefined, "创建样板合成");
         createButton.alignment = ["fill", "top"];
         createButton.preferredSize.height = 28;
-
-        templateTab.add("statictext", undefined,
-            "生成后可在合成中填入口型动画，再切换到“口型生成”。");
 
         var filePanel = ustTab.add("panel", undefined, "UST 文件");
         filePanel.orientation = "column";
@@ -1665,7 +1841,7 @@
 
             selectedUstFile = picked;
             selectedUstxProject = parsedUstx;
-            selectedFileLabel.text = picked.name;
+            selectedFileLabel.text = getDisplayFileName(picked);
             selectedFileLabel.helpTip = picked.fsName;
             encodingRow.visible = !isUstx;
             trackRow.visible = isUstx;
@@ -1681,6 +1857,110 @@
         chooseFileButton.onClick = function () {
             chooseUSTFile();
         };
+
+        // 口型时间设置：使用 ScriptUI 标准控件，保持 AE 原生脚本的界面风格。
+        var timingPanel = ustTab.add("panel", undefined, "口型时间设置");
+        timingPanel.orientation = "column";
+        timingPanel.alignChildren = ["fill", "top"];
+        timingPanel.spacing = 6;
+        timingPanel.margins = 10;
+
+        function addPercentControl(labelText, defaultValue, helpText) {
+            var row = timingPanel.add("group");
+            row.orientation = "row";
+            row.alignChildren = ["center", "center"];
+            row.spacing = 8;
+
+            var label = row.add("statictext", undefined, labelText);
+            label.preferredSize.width = 65;
+            var slider = row.add("slider", undefined, defaultValue, 0, 100);
+            slider.alignment = ["fill", "center"];
+            slider.preferredSize.width = 180;
+            slider.helpTip = helpText;
+            var valueInput = row.add("edittext", undefined, String(defaultValue));
+            valueInput.characters = 4;
+            valueInput.preferredSize.width = 42;
+            valueInput.helpTip = "输入 0–100 的整数百分比。";
+            row.add("statictext", undefined, "%");
+
+            function syncFromSlider() {
+                valueInput.text = String(Math.round(slider.value));
+            }
+            slider.onChanging = syncFromSlider;
+            slider.onChange = syncFromSlider;
+            valueInput.onChange = function () {
+                var value = parseFloat(valueInput.text);
+                if (isNaN(value)) {
+                    value = Number(slider.value);
+                }
+                value = Math.max(0, Math.min(100, Math.round(value)));
+                slider.value = value;
+                valueInput.text = String(value);
+            };
+            return {
+                slider: slider,
+                input: valueInput,
+                getValue: function () { return Math.max(0, Math.min(100, Math.round(slider.value))); }
+            };
+        }
+
+        function addOffsetControl() {
+            var row = timingPanel.add("group");
+            row.orientation = "row";
+            row.alignChildren = ["center", "center"];
+            row.spacing = 8;
+
+            var label = row.add("statictext", undefined, "整体偏移");
+            label.preferredSize.width = 65;
+            var slider = row.add("slider", undefined, 0, -100, 100);
+            slider.alignment = ["fill", "center"];
+            slider.preferredSize.width = 180;
+            slider.helpTip = "范围 -1.00 至 +1.00 秒；负数提前，正数延后。";
+            var valueInput = row.add("edittext", undefined, "0.00");
+            valueInput.characters = 6;
+            valueInput.preferredSize.width = 50;
+            valueInput.helpTip = "输入 -1.00 至 +1.00 秒，精度为 0.01 秒。";
+            row.add("statictext", undefined, "s");
+
+            function syncFromSlider() {
+                var value = Math.round(slider.value) / 100.0;
+                valueInput.text = (value > 0 ? "+" : "") + value.toFixed(2);
+            }
+            slider.onChanging = syncFromSlider;
+            slider.onChange = syncFromSlider;
+            valueInput.onChange = function () {
+                var value = parseFloat(valueInput.text);
+                if (isNaN(value)) {
+                    value = Number(slider.value) / 100.0;
+                }
+                value = Math.max(-1, Math.min(1, value));
+                value = Math.round(value * 100) / 100.0;
+                slider.value = Math.round(value * 100);
+                valueInput.text = (value > 0 ? "+" : "") + value.toFixed(2);
+            };
+            return {
+                slider: slider,
+                input: valueInput,
+                getValue: function () { return Math.max(-1, Math.min(1, Math.round(slider.value) / 100.0)); }
+            };
+        }
+
+        var openTimeControl = addPercentControl(
+            "开口时间", 100,
+            "从音符开始到对应元音 hold 的时间。0–100% 对应 0–0.5 秒；短音符会按可用时长缩短。"
+        );
+        var closeTimeControl = addPercentControl(
+            "闭口时间", 100,
+            "从对应元音 hold 到音符结尾的时间。0–100% 对应 0–0.5 秒；短音符会按可用时长缩短。"
+        );
+        var offsetTimeControl = addOffsetControl();
+        function getTimingSettings() {
+            return {
+                openPercent: openTimeControl.getValue(),
+                closePercent: closeTimeControl.getValue(),
+                timeOffset: offsetTimeControl.getValue()
+            };
+        }
 
         var parseButton = ustTab.add("button", undefined, "导出.tsv文件");
         parseButton.alignment = ["fill", "top"];
@@ -1707,7 +1987,7 @@
                 if (!/\.tsv$/i.test(outputFile.name)) {
                     outputFile = new File(outputFile.fsName + ".tsv");
                 }
-                writeEventTSV(outputFile, result);
+                writeEventTSV(outputFile, result, getTimingSettings());
             } catch (err) {
                 alert("解析文件时发生错误：\n" + err.toString(), SCRIPT_NAME);
             }
@@ -1745,7 +2025,7 @@
                         return;
                     }
                 }
-                var plan = applyTimeRemapToSelectedLayer(result);
+                var plan = applyTimeRemapToSelectedLayer(result, getTimingSettings());
                 if (!plan) {
                     return;
                 }
