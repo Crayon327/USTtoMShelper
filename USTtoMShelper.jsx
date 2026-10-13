@@ -3,15 +3,14 @@
 
 /*
  * USTtoMShelper - 口型样板、UST 解析与时间重映射
- * v0.6.0
- * 创建 7 秒口型样板，解析传统 UST，并根据日语元音生成时间重映射。
- * 可放入 Scripts/ScriptUI Panels 作为面板运行，也可通过“运行脚本文件”运行。
+ * v0.8.0
+ * 创建 7 秒口型样板，解析 UST/USTX，并根据所选轨道的日语元音生成时间重映射。
  */
+
 (function (thisObj) {
     var SCRIPT_NAME = "USTtoMShelper";
     var PANEL_TITLE = "USTtoMShelper - 口型辅助";
 
-    // 样板合成参数；后续时间重映射根据这些固定标记定位口型。
     var TEMPLATE_DURATION = 7.0;
     var FRAME_RATE = 30.0;
     var PIXEL_ASPECT = 1.0;
@@ -54,7 +53,6 @@
             compName, width, height, PIXEL_ASPECT, TEMPLATE_DURATION, FRAME_RATE
         );
 
-        // 添加 7 个状态/边界标记。
         addCompMarker(comp, tA, "a");
         addCompMarker(comp, tI, "i");
         addCompMarker(comp, tU, "u");
@@ -62,8 +60,6 @@
         addCompMarker(comp, tO, "o");
         addCompMarker(comp, tOEnd, "o-end");
         addCompMarker(comp, tClosed, "closed");
-
-        // 每段中点作为长音维持位置。
         addCompMarker(comp, (tA + tI) / 2, "a-hold");
         addCompMarker(comp, (tI + tU) / 2, "i-hold");
         addCompMarker(comp, (tU + tE) / 2, "u-hold");
@@ -74,9 +70,8 @@
         return comp;
     }
 
-    // ---- UST 文件读取 ----------------------------------------------------
-
-    // 根据用户选择、BOM 与 Charset 声明决定 UST 的读取编码。
+    // UST 文件读取 
+    // 读取编码
     function detectUSTEncoding(rawText, encodingMode) {
         if (encodingMode === 1) {
             return "UTF-8";
@@ -85,7 +80,6 @@
             return "Shift_JIS";
         }
 
-        // 存在 UTF-8 BOM 或 Charset 声明时，优先使用文件声明的编码。
         if (rawText.length >= 3 && rawText.charCodeAt(0) === 239 &&
             rawText.charCodeAt(1) === 187 && rawText.charCodeAt(2) === 191) {
             return "UTF-8";
@@ -98,11 +92,9 @@
             return "Shift_JIS";
         }
 
-        // 未声明编码时，传统 UST 默认按 Shift-JIS 读取。
         return "Shift_JIS";
     }
 
-    // 先以二进制方式检查文件头，再按选定编码读取文本。
     function readUSTFile(ustFile, encodingMode) {
         var rawFile = new File(ustFile.fsName);
         rawFile.encoding = "BINARY";
@@ -125,7 +117,7 @@
         return { text: text, encoding: encoding };
     }
 
-    // ---- 日语元音识别 ----------------------------------------------------
+    // 日语元音识别
 
     var kanaVowel = {};
 
@@ -150,7 +142,7 @@
         return ch;
     }
 
-    // 将歌词归类为 a/i/u/e/o、closed 或 unknown；本版不分析辅音。
+    // 将歌词归类为 a/i/u/e/o、closed 或 unknown。
     function classifyLyric(lyric, previousVowel) {
         var original = trimText(lyric);
         var lower = original.toLowerCase();
@@ -160,7 +152,11 @@
             return { vowel: "closed", kind: "rest", recognized: true };
         }
         if (/^(っ|ッ)$/.test(original)) {
-            return { vowel: "closed", kind: "closure", recognized: true };
+            // 促音沿用上一个有效元音
+            if (previousVowel && /^[aiueo]$/.test(previousVowel)) {
+                return { vowel: previousVowel, kind: "sokuon", recognized: true };
+            }
+            return { vowel: "closed", kind: "sokuon", recognized: true };
         }
         if (/^(ん|ン|n)$/i.test(original)) {
             return { vowel: "closed", kind: "closure", recognized: true };
@@ -172,15 +168,18 @@
             return { vowel: "unknown", kind: "unknown", recognized: false };
         }
 
-        // 按歌词中最后一个可识别假名判断元音，可处理「きゃ」「しゅ」「てぃ」等拗音组合。
-        // 片假名会先转换为平假名再进行识别。
+        // 拗音取最后一个假名
         for (i = 0; i < original.length; i++) {
             ch = original.charAt(i);
             hira = toHiraganaChar(ch);
             if (hira === "ん") {
                 found = "closed";
             } else if (hira === "っ") {
-                found = "closed";
+                // 促音继承上一个音符的元音
+                if (!/^[aiueo]$/.test(found)) {
+                    found = (previousVowel && /^[aiueo]$/.test(previousVowel))
+                        ? previousVowel : "closed";
+                }
             } else if (kanaVowel[hira]) {
                 found = kanaVowel[hira];
             }
@@ -192,8 +191,7 @@
             return { vowel: "closed", kind: "closure", recognized: true };
         }
 
-        // 无法识别假名时，尝试按常见罗马字别名的末尾元音判断。
-        // 无法判断的别名保留为 unknown，供后续手动映射。
+        // 无法识别假名时，尝试按常见罗马字别名的末尾元音判断，否则保留为 unknown
         tokens = lower.split(/\s+/);
         lastToken = tokens[tokens.length - 1];
         if (/^(r|rest|sil|silence|pau|sp|cl|br|n)$/.test(lastToken)) {
@@ -207,9 +205,7 @@
         return { vowel: "unknown", kind: "unknown", recognized: false };
     }
 
-    // ---- UST 解析与时间计算 ----------------------------------------------
-
-    // 读取音符区段，累计 Length 与 Tempo，得到每个音符的起止时间。
+    // 时间计算
     function parseUSTText(text) {
         var lines = text.split(/\r\n|\n|\r/);
         var sections = [];
@@ -372,8 +368,662 @@
         return result;
     }
 
-    // ---- 样板标记读取与时间重映射 ------------------------------------------
+    // USTX 文件读取
+    function readUSTXFile(file) {
+        var textFile = new File(file.fsName);
+        textFile.encoding = "UTF-8";
+        if (!textFile.open("r")) {
+            throw new Error("无法读取 USTX 文件：" + file.fsName);
+        }
+        var text = textFile.read();
+        textFile.close();
+        return text.replace(/^\uFEFF/, "");
+    }
 
+    function yamlIndent(line) {
+        var m = line.match(/^[ \t]*/);
+        return m ? m[0].length : 0;
+    }
+
+    function yamlPair(line) {
+        var text = trimText(line);
+        if (text.charAt(0) === "-") {
+            text = trimText(text.substring(1));
+        }
+        var p = text.indexOf(":");
+        if (p <= 0) {
+            return null;
+        }
+        return {
+            key: trimText(text.substring(0, p)).toLowerCase(),
+            value: trimText(text.substring(p + 1))
+        };
+    }
+
+    // 去掉简单标量的引号与行尾注释
+    function yamlScalar(value) {
+        var v = trimText(value);
+        if (!v) {
+            return "";
+        }
+        if (v.charAt(0) === '"' && v.lastIndexOf('"') > 0) {
+            v = v.substring(1, v.lastIndexOf('"'));
+            v = v.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+            return v;
+        }
+        if (v.charAt(0) === "'" && v.lastIndexOf("'") > 0) {
+            return v.substring(1, v.lastIndexOf("'")).replace(/''/g, "'");
+        }
+        return v.replace(/\s+#.*$/, "");
+    }
+
+    // 读取常见的 YAML 行内映射
+    function yamlInlineField(value, fieldName) {
+        var escaped = fieldName.replace(/[-]/g, "\\-");
+        var re = new RegExp("(?:^|[,\\{])\\s*" + escaped + "\\s*:\\s*(\\\"(?:\\\\.|[^\\\"])*\\\"|'(?:''|[^'])*'|[^,}]+)", "i");
+        var m = String(value).match(re);
+        return m ? yamlScalar(m[1]) : "";
+    }
+
+    function parseUSTXStructure(text) {
+        var lines = text.split(/\r\n|\n|\r/);
+        var section = "";
+        var tracks = [];
+        var parts = [];
+        var tempos = [];
+        var projectName = "";
+        var defaultBpm = DEFAULT_BPM;
+        var resolution = TICKS_PER_QUARTER;
+        var i, line, indent, content, pair, dash, payload, k, n;
+        var currentTrack = null;
+        var trackListIndent = null;
+        var singerIndent = -1;
+        var currentPart = null;
+        var partListIndent = null;
+        var inNotes = false;
+        var notesPropertyIndent = -1;
+        var noteListIndent = null;
+        var currentNote = null;
+        var currentTempo = null;
+        var tempoListIndent = null;
+
+        function applyTrackField(track, key, value, fieldIndent) {
+            var raw = trimText(value);
+            if (singerIndent >= 0 && fieldIndent > singerIndent) {
+                if (key === "id" || key === "name" || key === "path" || key === "location") {
+                    if (key === "name") {
+                        track.singerName = yamlScalar(raw);
+                    } else if (key === "id" && !track.singerId) {
+                        track.singerId = yamlScalar(raw);
+                    } else if (!track.singerId) {
+                        track.singerId = yamlScalar(raw);
+                    }
+                }
+                return;
+            }
+            if (singerIndent >= 0 && fieldIndent <= singerIndent) {
+                singerIndent = -1;
+            }
+            if (key === "track_name") {
+                track.trackName = yamlScalar(raw);
+            } else if (key === "name" && !track.trackName) {
+                track.trackName = yamlScalar(raw);
+            } else if (key === "singer") {
+                if (!raw) {
+                    singerIndent = fieldIndent;
+                } else if (raw.charAt(0) === "{") {
+                    track.singerName = yamlInlineField(raw, "name");
+                    track.singerId = yamlInlineField(raw, "id");
+                    if (!track.singerName) {
+                        track.singerName = yamlInlineField(raw, "display_name");
+                    }
+                } else {
+                    track.singerId = yamlScalar(raw);
+                }
+            }
+        }
+
+        function applyPartField(part, key, value) {
+            var raw = yamlScalar(value);
+            if (key === "name") {
+                part.name = raw;
+            } else if (key === "track_no") {
+                part.trackNo = parseInt(raw, 10);
+            } else if (key === "position") {
+                part.position = parseFloat(raw);
+                if (isNaN(part.position)) {
+                    part.position = 0;
+                }
+            }
+        }
+
+        function applyNoteField(note, key, value) {
+            var raw = yamlScalar(value);
+            if (key === "position") {
+                note.position = parseFloat(raw);
+            } else if (key === "duration") {
+                note.duration = parseFloat(raw);
+            } else if (key === "lyric") {
+                note.lyric = raw;
+            } else if (key === "tone") {
+                note.tone = parseInt(raw, 10);
+            }
+        }
+
+        for (i = 0; i < lines.length; i++) {
+            line = lines[i];
+            content = trimText(line);
+            if (!content || content.charAt(0) === "#") {
+                continue;
+            }
+            indent = yamlIndent(line);
+
+            // 顶层字段均从第 0 列开始；切换顶层区域时重置当前解析对象。
+            if (indent === 0 && content.charAt(0) !== "-") {
+                pair = yamlPair(content);
+                if (pair) {
+                    section = pair.key;
+                    currentTrack = null;
+                    currentPart = null;
+                    currentTempo = null;
+                    inNotes = false;
+                    notesPropertyIndent = -1;
+                    noteListIndent = null;
+                    singerIndent = -1;
+                    if (section === "name") {
+                        projectName = yamlScalar(pair.value);
+                    } else if (section === "bpm") {
+                        n = parseFloat(yamlScalar(pair.value));
+                        if (!isNaN(n) && n > 0) {
+                            defaultBpm = n;
+                        }
+                    } else if (section === "resolution") {
+                        n = parseFloat(yamlScalar(pair.value));
+                        if (!isNaN(n) && n > 0) {
+                            resolution = n;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            dash = line.match(/^([ \t]*)-\s*(.*)$/);
+            payload = dash ? dash[2] : "";
+
+            if (section === "tracks") {
+                if (dash && (trackListIndent === null || indent === trackListIndent)) {
+                    if (trackListIndent === null) {
+                        trackListIndent = indent;
+                    }
+                    currentTrack = {
+                        index: tracks.length,
+                        trackNo: tracks.length,
+                        trackName: "",
+                        singerId: "",
+                        singerName: "",
+                        singer: ""
+                    };
+                    tracks.push(currentTrack);
+                    singerIndent = -1;
+                    if (payload) {
+                        pair = yamlPair(payload);
+                        if (pair) {
+                            applyTrackField(currentTrack, pair.key, pair.value, indent + 2);
+                        } else if (payload.charAt(0) === "{") {
+                            currentTrack.trackName = yamlInlineField(payload, "track_name");
+                            currentTrack.singerName = yamlInlineField(payload, "singer_name");
+                            currentTrack.singerId = yamlInlineField(payload, "singer");
+                        }
+                    }
+                    continue;
+                }
+                pair = yamlPair(content);
+                if (currentTrack && pair && indent > trackListIndent) {
+                    applyTrackField(currentTrack, pair.key, pair.value, indent);
+                }
+            } else if (section === "voice_parts") {
+                // 声部列表项与其内部 notes 列表的缩进不同。
+                if (dash && (partListIndent === null || indent === partListIndent)) {
+                    if (partListIndent === null) {
+                        partListIndent = indent;
+                    }
+                    currentPart = {
+                        name: "",
+                        trackNo: -1,
+                        position: 0,
+                        notes: []
+                    };
+                    parts.push(currentPart);
+                    inNotes = false;
+                    notesPropertyIndent = -1;
+                    noteListIndent = null;
+                    currentNote = null;
+                    if (payload) {
+                        pair = yamlPair(payload);
+                        if (pair) {
+                            applyPartField(currentPart, pair.key, pair.value);
+                        } else if (payload.charAt(0) === "{") {
+                            currentPart.name = yamlInlineField(payload, "name");
+                            currentPart.trackNo = parseInt(yamlInlineField(payload, "track_no"), 10);
+                            currentPart.position = parseFloat(yamlInlineField(payload, "position")) || 0;
+                        }
+                    }
+                    continue;
+                }
+
+                pair = yamlPair(content);
+                if (inNotes) {
+                    if (dash) {
+                        if (noteListIndent === null && indent > partListIndent) {
+                            noteListIndent = indent;
+                        }
+                        if (noteListIndent !== null && indent === noteListIndent) {
+                            currentNote = { position: NaN, duration: NaN, lyric: "", tone: "" };
+                            currentPart.notes.push(currentNote);
+                            if (payload) {
+                                pair = yamlPair(payload);
+                                if (pair) {
+                                    applyNoteField(currentNote, pair.key, pair.value);
+                                } else if (payload.charAt(0) === "{") {
+                                    currentNote.position = parseFloat(yamlInlineField(payload, "position"));
+                                    currentNote.duration = parseFloat(yamlInlineField(payload, "duration"));
+                                    currentNote.lyric = yamlInlineField(payload, "lyric");
+                                    currentNote.tone = yamlInlineField(payload, "tone");
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if (pair && noteListIndent !== null && indent > noteListIndent) {
+                        applyNoteField(currentNote, pair.key, pair.value);
+                        continue;
+                    }
+                    if (pair && ((noteListIndent !== null && indent <= noteListIndent) ||
+                        (noteListIndent === null && indent <= notesPropertyIndent))) {
+                        inNotes = false;
+                        currentNote = null;
+                    } else {
+                        continue;
+                    }
+                }
+
+                pair = yamlPair(content);
+                if (currentPart && pair && indent > partListIndent) {
+                    if (pair.key === "notes") {
+                        notesPropertyIndent = indent;
+                        noteListIndent = null;
+                        currentNote = null;
+                        inNotes = pair.value === "";
+                    } else {
+                        applyPartField(currentPart, pair.key, pair.value);
+                    }
+                }
+            } else if (section === "tempos") {
+                if (dash && (tempoListIndent === null || indent === tempoListIndent)) {
+                    if (tempoListIndent === null) {
+                        tempoListIndent = indent;
+                    }
+                    currentTempo = { position: 0, bpm: NaN };
+                    tempos.push(currentTempo);
+                    if (payload) {
+                        pair = yamlPair(payload);
+                        if (pair) {
+                            if (pair.key === "position") {
+                                currentTempo.position = parseFloat(yamlScalar(pair.value));
+                            } else if (pair.key === "bpm") {
+                                currentTempo.bpm = parseFloat(yamlScalar(pair.value));
+                            }
+                        } else if (payload.charAt(0) === "{") {
+                            currentTempo.position = parseFloat(yamlInlineField(payload, "position"));
+                            currentTempo.bpm = parseFloat(yamlInlineField(payload, "bpm"));
+                        }
+                    }
+                    continue;
+                }
+                pair = yamlPair(content);
+                if (currentTempo && pair && indent > tempoListIndent) {
+                    if (pair.key === "position") {
+                        currentTempo.position = parseFloat(yamlScalar(pair.value));
+                    } else if (pair.key === "bpm") {
+                        currentTempo.bpm = parseFloat(yamlScalar(pair.value));
+                    }
+                }
+            }
+        }
+
+        if (tracks.length === 0) {
+            throw new Error("没有在 USTX 文件中找到 tracks 轨道列表。");
+        }
+        if (parts.length === 0) {
+            throw new Error("没有在 USTX 文件中找到 voice_parts 音符数据。");
+        }
+        if (tempos.length === 0) {
+            tempos.push({ position: 0, bpm: defaultBpm });
+        }
+        return {
+            name: projectName,
+            tracks: tracks,
+            parts: parts,
+            tempos: tempos,
+            defaultBpm: defaultBpm,
+            resolution: resolution
+        };
+    }
+
+    // 将 USTX 的 Tempo 列表整理成绝对 tick 与对应秒数
+    function buildUSTXTempoTimeline(tempoEvents, defaultBpm) {
+        var events = [];
+        var i, event, position, bpm;
+        var hasTempoAtZero = false;
+        for (i = 0; i < tempoEvents.length; i++) {
+            event = tempoEvents[i];
+            position = Number(event.position);
+            bpm = Number(event.bpm);
+            if (isNaN(position) || isNaN(bpm) || bpm <= 0 || position < 0) {
+                continue;
+            }
+            if (Math.abs(position) < 0.000001) {
+                hasTempoAtZero = true;
+            }
+            events.push({ position: position, bpm: bpm, order: i });
+        }
+        if (!hasTempoAtZero) {
+            events.push({ position: 0, bpm: defaultBpm, order: -1 });
+        }
+        events.sort(function (a, b) {
+            if (a.position !== b.position) {
+                return a.position - b.position;
+            }
+            return a.order - b.order;
+        });
+
+        var collapsed = [];
+        for (i = 0; i < events.length; i++) {
+            event = events[i];
+            if (collapsed.length > 0 && Math.abs(collapsed[collapsed.length - 1].position - event.position) < 0.000001) {
+                collapsed[collapsed.length - 1].bpm = event.bpm;
+            } else {
+                collapsed.push({ position: event.position, bpm: event.bpm });
+            }
+        }
+        if (collapsed.length === 0 || collapsed[0].position > 0) {
+            collapsed.unshift({ position: 0, bpm: defaultBpm });
+        }
+
+        var timeline = [];
+        var seconds = 0;
+        for (i = 0; i < collapsed.length; i++) {
+            if (i > 0) {
+                seconds += (collapsed[i].position - collapsed[i - 1].position) *
+                    (60.0 / (TICKS_PER_QUARTER * collapsed[i - 1].bpm));
+            }
+            timeline.push({
+                position: collapsed[i].position,
+                seconds: seconds,
+                bpm: collapsed[i].bpm
+            });
+        }
+        return timeline;
+    }
+
+    function ustxTickToSeconds(tick, timeline) {
+        var i, segment = timeline[0];
+        for (i = 1; i < timeline.length; i++) {
+            if (timeline[i].position <= tick) {
+                segment = timeline[i];
+            } else {
+                break;
+            }
+        }
+        return segment.seconds + (tick - segment.position) *
+            (60.0 / (TICKS_PER_QUARTER * segment.bpm));
+    }
+
+    function ustxBpmAtTick(tick, timeline) {
+        var i, bpm = timeline.length ? timeline[0].bpm : DEFAULT_BPM;
+        for (i = 0; i < timeline.length; i++) {
+            if (timeline[i].position <= tick) {
+                bpm = timeline[i].bpm;
+            } else {
+                break;
+            }
+        }
+        return bpm;
+    }
+
+    function summarizeEventCounts(result) {
+        result.counts = { vowels: 0, closed: 0, unknown: 0 };
+        var i, vowel;
+        for (i = 0; i < result.notes.length; i++) {
+            vowel = result.notes[i].vowel;
+            if (/^[aiueo]$/.test(vowel)) {
+                result.counts.vowels++;
+            } else if (vowel === "closed") {
+                result.counts.closed++;
+            } else {
+                result.counts.unknown++;
+            }
+        }
+        return result;
+    }
+
+    // 将 USTX 中指定 track_no 的所有声部整理到同一条时间线上
+    function buildUSTXTrackResult(project, track, tempoTimeline, trackWarnings) {
+        var rawNotes = [];
+        var partIndex, noteIndex, part, raw, note, i;
+        var partNotes, startTick, endTick;
+        var notes = [];
+        var warnings = trackWarnings;
+
+        for (partIndex = 0; partIndex < project.parts.length; partIndex++) {
+            part = project.parts[partIndex];
+            if (part.trackNo !== track.trackNo) {
+                continue;
+            }
+            for (noteIndex = 0; noteIndex < part.notes.length; noteIndex++) {
+                partNotes = part.notes[noteIndex];
+                startTick = Number(part.position) + Number(partNotes.position);
+                endTick = startTick + Number(partNotes.duration);
+                if (isNaN(startTick) || isNaN(endTick) || endTick <= startTick) {
+                    warnings.push("轨道“" + track.trackName + "”中存在无效音符时长，已跳过。");
+                    continue;
+                }
+                rawNotes.push({
+                    startTick: startTick,
+                    endTick: endTick,
+                    lyric: partNotes.lyric === undefined ? "" : String(partNotes.lyric),
+                    tone: partNotes.tone === undefined ? "" : partNotes.tone,
+                    section: (part.name || ("声部" + (partIndex + 1))) + "#" + (noteIndex + 1),
+                    partIndex: partIndex,
+                    noteIndex: noteIndex
+                });
+            }
+        }
+
+        rawNotes.sort(function (a, b) {
+            if (a.startTick !== b.startTick) {
+                return a.startTick - b.startTick;
+            }
+            if (a.partIndex !== b.partIndex) {
+                return a.partIndex - b.partIndex;
+            }
+            return a.noteIndex - b.noteIndex;
+        });
+
+        // 处理同一轨道重叠情况
+        var nonOverlapping = [];
+        var last;
+        for (i = 0; i < rawNotes.length; i++) {
+            raw = rawNotes[i];
+            while (nonOverlapping.length > 0) {
+                last = nonOverlapping[nonOverlapping.length - 1];
+                if (raw.startTick >= last.endTick) {
+                    break;
+                }
+                warnings.push("轨道“" + track.trackName + "”存在重叠音符，已按后开始的音符截短前一音符。");
+                if (raw.startTick <= last.startTick) {
+                    nonOverlapping.pop();
+                } else {
+                    last.endTick = raw.startTick;
+                    break;
+                }
+            }
+            if (raw.endTick > raw.startTick) {
+                nonOverlapping.push(raw);
+            }
+        }
+
+        var cursorTick = 0;
+        var previousVowel = "";
+        var item, classified, gapEvent, totalTicks = 0;
+        for (i = 0; i < nonOverlapping.length; i++) {
+            raw = nonOverlapping[i];
+            if (raw.startTick > cursorTick) {
+                gapEvent = {
+                    index: notes.length + 1,
+                    section: "gap_" + cursorTick + "_" + raw.startTick,
+                    startTick: cursorTick,
+                    endTick: raw.startTick,
+                    startSeconds: ustxTickToSeconds(cursorTick, tempoTimeline),
+                    endSeconds: ustxTickToSeconds(raw.startTick, tempoTimeline),
+                    durationSeconds: ustxTickToSeconds(raw.startTick, tempoTimeline) - ustxTickToSeconds(cursorTick, tempoTimeline),
+                    bpm: ustxBpmAtTick(cursorTick, tempoTimeline),
+                    lyric: "",
+                    vowel: "closed",
+                    kind: "rest",
+                    recognized: true,
+                    noteNumber: "",
+                    trackNo: track.trackNo,
+                    trackName: track.trackName,
+                    singer: track.singer,
+                    isGap: true,
+                    startsAfterGap: false
+                };
+                notes.push(gapEvent);
+                previousVowel = "";
+            }
+
+            classified = classifyLyric(raw.lyric, previousVowel);
+            var previousEvent = notes.length > 0 ? notes[notes.length - 1] : null;
+            var followsClosed = !previousEvent || previousEvent.isGap || previousEvent.vowel === "closed" || previousEvent.vowel === "unknown";
+            item = {
+                index: notes.length + 1,
+                section: raw.section,
+                startTick: raw.startTick,
+                endTick: raw.endTick,
+                startSeconds: ustxTickToSeconds(raw.startTick, tempoTimeline),
+                endSeconds: ustxTickToSeconds(raw.endTick, tempoTimeline),
+                durationSeconds: ustxTickToSeconds(raw.endTick, tempoTimeline) - ustxTickToSeconds(raw.startTick, tempoTimeline),
+                bpm: ustxBpmAtTick(raw.startTick, tempoTimeline),
+                lyric: raw.lyric,
+                vowel: classified.vowel,
+                kind: classified.kind,
+                recognized: classified.recognized,
+                noteNumber: raw.tone,
+                trackNo: track.trackNo,
+                trackName: track.trackName,
+                singer: track.singer,
+                isGap: false,
+                startsAfterGap: followsClosed
+            };
+            notes.push(item);
+            if (/^[aiueo]$/.test(classified.vowel)) {
+                previousVowel = classified.vowel;
+            } else {
+                previousVowel = "";
+            }
+            cursorTick = raw.endTick;
+            if (raw.endTick > totalTicks) {
+                totalTicks = raw.endTick;
+            }
+        }
+
+        var result = {
+            format: "ustx",
+            fileName: "",
+            trackNo: track.trackNo,
+            trackName: track.trackName,
+            singer: track.singer,
+            notes: notes,
+            warnings: warnings,
+            initialBpm: tempoTimeline.length ? tempoTimeline[0].bpm : DEFAULT_BPM,
+            totalTicks: totalTicks,
+            totalSeconds: ustxTickToSeconds(totalTicks, tempoTimeline),
+            noteSectionsFound: nonOverlapping.length
+        };
+        summarizeEventCounts(result);
+        return result;
+    }
+
+    // 解析整个 USTX 项目
+    function parseUSTXFile(file) {
+        var structure = parseUSTXStructure(readUSTXFile(file));
+        var tempoTimeline = buildUSTXTempoTimeline(structure.tempos, structure.defaultBpm);
+        var i, track, trackResult, allNotes = [], allWarnings = [];
+        var trackResults = [];
+        var trackOptions = [];
+        var maxSeconds = 0;
+
+        for (i = 0; i < structure.tracks.length; i++) {
+            track = structure.tracks[i];
+            track.trackNo = i;
+            if (!track.trackName) {
+                track.trackName = "轨道 " + (i + 1);
+            }
+            if (track.singerName && track.singerId && track.singerName !== track.singerId) {
+                track.singer = track.singerName + "（" + track.singerId + "）";
+            } else {
+                track.singer = track.singerName || track.singerId || "未指定歌手";
+            }
+            trackOptions.push({
+                trackNo: i,
+                trackName: track.trackName,
+                singer: track.singer
+            });
+            trackResult = buildUSTXTrackResult(structure, track, tempoTimeline, []);
+            trackResult.fileName = file.name;
+            trackResults.push(trackResult);
+            for (var j = 0; j < trackResult.notes.length; j++) {
+                allNotes.push(trackResult.notes[j]);
+            }
+            for (j = 0; j < trackResult.warnings.length; j++) {
+                allWarnings.push(trackResult.warnings[j]);
+            }
+            if (trackResult.totalSeconds > maxSeconds) {
+                maxSeconds = trackResult.totalSeconds;
+            }
+        }
+
+        allNotes.sort(function (a, b) {
+            if (a.startSeconds !== b.startSeconds) {
+                return a.startSeconds - b.startSeconds;
+            }
+            return a.trackNo - b.trackNo;
+        });
+        var exportResult = {
+            format: "ustx",
+            fileName: file.name,
+            notes: allNotes,
+            warnings: allWarnings,
+            totalSeconds: maxSeconds,
+            totalTicks: 0,
+            initialBpm: tempoTimeline.length ? tempoTimeline[0].bpm : DEFAULT_BPM,
+            trackResults: trackResults,
+            tracks: trackOptions
+        };
+        summarizeEventCounts(exportResult);
+        return {
+            format: "ustx",
+            fileName: file.name,
+            tracks: trackOptions,
+            trackResults: trackResults,
+            exportResult: exportResult,
+            projectName: structure.name,
+            warnings: allWarnings
+        };
+    }
+
+    // 标记读取与时间重映射 
     function getCompMarkerTime(comp, markerName) {
         var markers = comp.markerProperty;
         var i, marker;
@@ -390,8 +1040,6 @@
     }
 
     function getTemplateMarkerMap(sourceItem) {
-        // 默认时间与样板生成器的标记安排一致。
-        // 所选素材没有标记或不是预合成时，仍使用这组固定时间，不阻止应用。
         var found = {
             "a": 0.0,
             "a-hold": 0.5,
@@ -414,7 +1062,7 @@
         var allMarkersFound = sourceItem instanceof CompItem;
         var i, t;
 
-        // 若来源是预合成且含有全部标记，则采用其实际时间；否则保留默认时间。
+        // 若来源是预合成且含有全部标记，则采用其实际时间
         if (allMarkersFound) {
             try {
                 for (i = 0; i < names.length; i++) {
@@ -431,7 +1079,6 @@
         }
 
         if (allMarkersFound) {
-            // 若标记完整但排列不符合约定，使用默认时间，避免阻止应用。
             var ordered = true;
             var vowelCheck = ["a", "i", "u", "e", "o"];
             for (i = 0; i < vowelCheck.length; i++) {
@@ -464,6 +1111,45 @@
         return /^[aiueo]$/.test(note.vowel);
     }
 
+    // 合并相邻的同元音音符
+    function mergeContinuousSameVowelNotes(notes) {
+        var merged = [];
+        var i, note, current, key, copy, isContinuous;
+        var epsilon = 0.000001;
+
+        for (i = 0; i < notes.length; i++) {
+            note = notes[i];
+            copy = {};
+            for (key in note) {
+                if (note.hasOwnProperty(key)) {
+                    copy[key] = note[key];
+                }
+            }
+
+            current = merged.length > 0 ? merged[merged.length - 1] : null;
+            isContinuous = current !== null &&
+                isVowelEvent(current) && isVowelEvent(copy) &&
+                current.vowel === copy.vowel &&
+                !current.isGap && !copy.isGap &&
+                !copy.startsAfterGap &&
+                Math.abs(current.endSeconds - copy.startSeconds) <= epsilon;
+
+            if (isContinuous) {
+                if (!current.sameVowelBoundaries) {
+                    current.sameVowelBoundaries = [];
+                }
+                current.sameVowelBoundaries.push(copy.startSeconds);
+                current.endSeconds = copy.endSeconds;
+                current.endTick = copy.endTick;
+                current.durationSeconds = current.endSeconds - current.startSeconds;
+                current.mergedNoteCount = (current.mergedNoteCount || 1) + (copy.mergedNoteCount || 1);
+            } else {
+                merged.push(copy);
+            }
+        }
+        return merged;
+    }
+
     function appendRemapKey(keys, time, sourceTime, sourceLabel) {
         var i;
         var epsilon = 0.000001;
@@ -478,9 +1164,9 @@
         keys.push({ time: time, sourceTime: sourceTime, sourceLabel: sourceLabel });
     }
 
-    // 将 UST 音符转换为外层合成时间与样板源时间之间的关键帧计划。
+    // 将 UST 音符转换为外层合成时间与样板源时间之间的关键帧
     function buildTimeRemapPlan(parseResult, layer, parentComp, markerMap) {
-        var notes = parseResult.notes;
+        var notes = mergeContinuousSameVowelNotes(parseResult.notes);
         var keys = [];
         var warnings = [];
         var frameDuration = parentComp.frameDuration;
@@ -491,6 +1177,7 @@
         var noteStart, noteEnd, noteDuration, endKeyTime, trimsOutgoing;
         var inDistance, outDistance, transitionIn, transitionOut;
         var holdStartTime, holdEndTime, midpoint;
+        var firstSameVowelBoundary, lastSameVowelBoundary, availableIn, availableOut;
         var tiny = 0.000001;
         var shortNotes = 0;
 
@@ -514,9 +1201,7 @@
             noteEnd = baseInPoint + note.endSeconds;
             noteDuration = noteEnd - noteStart;
 
-            // 第一条音符从对应源时间 +0.25 秒开始；无元音音符从 closed +0.25 秒开始。
-            // 其余元音之间的交界从当前元音标记的 0.00 秒位置开始。
-            sourceStart = sourceBase + ((i === 0 || !isVowelEvent(note)) ? 0.25 : 0.0);
+            sourceStart = sourceBase + ((i === 0 || !isVowelEvent(note) || note.startsAfterGap) ? 0.25 : 0.0);
 
             trimsOutgoing = nextNote !== null && !isVowelEvent(nextNote);
             if (isVowelEvent(note)) {
@@ -527,8 +1212,6 @@
                 sourceEnd = trimsOutgoing ? sourceBase + 0.75 : sourceStart;
             }
 
-            // 除最后一条音符外，出点通常提前一帧，避免交界两侧的源时间冲突。
-            // 下一条音符没有元音时，前一元音的出点缩短到该元音段起点 +0.75 秒。
             endKeyTime = noteEnd;
             if (nextNote !== null) {
                 var boundaryOffset = Math.min(frameDuration, noteDuration / 2.0);
@@ -549,8 +1232,17 @@
                 noteDuration = endKeyTime - noteStart;
                 inDistance = Math.max(0, sourceHold - sourceStart);
                 outDistance = Math.max(0, sourceEnd - sourceHold);
-                transitionIn = Math.min(inDistance, noteDuration / 2.0);
-                transitionOut = Math.min(outDistance, noteDuration / 2.0);
+                if (note.sameVowelBoundaries && note.sameVowelBoundaries.length > 0) {
+                    firstSameVowelBoundary = baseInPoint + note.sameVowelBoundaries[0];
+                    lastSameVowelBoundary = baseInPoint + note.sameVowelBoundaries[note.sameVowelBoundaries.length - 1];
+                    availableIn = Math.max(0, (firstSameVowelBoundary - noteStart) / 2.0);
+                    availableOut = Math.max(0, (endKeyTime - lastSameVowelBoundary) / 2.0);
+                    transitionIn = Math.min(inDistance, availableIn);
+                    transitionOut = Math.min(outDistance, availableOut);
+                } else {
+                    transitionIn = Math.min(inDistance, noteDuration / 2.0);
+                    transitionOut = Math.min(outDistance, noteDuration / 2.0);
+                }
                 holdStartTime = noteStart + transitionIn;
                 holdEndTime = endKeyTime - transitionOut;
 
@@ -563,8 +1255,6 @@
                 }
                 appendRemapKey(keys, endKeyTime, sourceEnd, "note-end");
             } else {
-                // 休止、闭口或未识别歌词暂时使用闭口源时间。
-                // 未识别的歌词会另外给出提示，后续可加入音源别名映射。
                 appendRemapKey(keys, endKeyTime, sourceEnd, "closed-note-end");
                 if (note.vowel === "unknown") {
                     warnings.push("音符 " + note.section + " 的歌词别名未识别，已临时按闭口处理：" + note.lyric);
@@ -589,7 +1279,7 @@
         };
     }
 
-    // 检查当前合成与选中图层，再将计算结果写入 Time Remapping。
+    // 将计算结果写入时间重映射
     function applyTimeRemapToSelectedLayer(parseResult) {
         if (!app.project) {
             throw new Error("当前没有打开的 After Effects 工程。");
@@ -621,9 +1311,6 @@
 
         app.beginUndoGroup("应用 UST 口型时间重映射");
         try {
-            // 重新启用时间重映射，以恢复 AE 自动创建的默认关键帧。
-            // 注意：时间重映射属性不能在一个关键帧也没有时添加关键帧，
-            // 否则会出现“属性或父级属性被隐藏”的错误。
             if (layer.timeRemapEnabled) {
                 layer.timeRemapEnabled = false;
             }
@@ -637,13 +1324,10 @@
 
             var k, j, existingTime, keepKey, keyTimeTolerance = 0.0001;
 
-            // 先写入目标关键帧，保留 AE 创建的默认关键帧，避免属性被隐藏。
+            // 保留 AE 创建的默认关键帧，避免属性被隐藏
             for (k = 0; k < plan.keys.length; k++) {
                 remap.setValueAtTime(plan.keys[k].time, plan.keys[k].sourceTime);
             }
-
-            // 目标关键帧全部写入后，再移除不属于本次计划的默认关键帧。
-            // 始终至少保留一个关键帧，防止时间重映射属性进入隐藏状态。
             for (k = remap.numKeys; k >= 1; k--) {
                 existingTime = remap.keyTime(k);
                 keepKey = false;
@@ -658,10 +1342,6 @@
                 }
             }
 
-            // 音符内部使用线性插值，保证口型从中性形态过渡到维持形态，再返回中性形态。
-            // 音符交界处的出点改用保持插值，避免 AE 在相邻源时间之间穿过其他口型段。
-            // 例如 i 的出点为 2 秒、下一个 e 的入点为 3 秒；若用线性插值，
-            // 两者之间会采样到 u 段，因而在 i→e 的交界错误出现 u 口型。
             var planKey, outgoingInterpolation;
             for (k = 1; k <= remap.numKeys; k++) {
                 planKey = null;
@@ -697,41 +1377,61 @@
         return Number(value).toFixed(6);
     }
 
-    // 导出可用表格软件查看的音符事件表。
     function writeEventTSV(outputFile, result) {
         var out = new File(outputFile.fsName);
         out.encoding = "UTF-8";
         if (!out.open("w")) {
             throw new Error("无法创建事件表文件：" + outputFile.fsName);
         }
-        out.writeln("index\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number");
+        if (result.format === "ustx") {
+            out.writeln("track_no\ttrack_name\tsinger\tindex\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number");
+        } else {
+            out.writeln("index\tsection\tstart_tick\tend_tick\tstart_sec\tend_sec\tduration_sec\tbpm\tlyric\tvowel\tevent_type\tnote_number");
+        }
         var i, n, row;
         for (i = 0; i < result.notes.length; i++) {
             n = result.notes[i];
-            row = [
-                n.index,
-                n.section,
-                tsvNumber(n.startTick),
-                tsvNumber(n.endTick),
-                tsvNumber(n.startSeconds),
-                tsvNumber(n.endSeconds),
-                tsvNumber(n.durationSeconds),
-                tsvNumber(n.bpm),
-                tsvCell(n.lyric),
-                n.vowel,
-                n.kind,
-                tsvCell(n.noteNumber)
-            ];
+            if (result.format === "ustx") {
+                row = [
+                    n.trackNo,
+                    tsvCell(n.trackName),
+                    tsvCell(n.singer),
+                    n.index,
+                    tsvCell(n.section),
+                    tsvNumber(n.startTick),
+                    tsvNumber(n.endTick),
+                    tsvNumber(n.startSeconds),
+                    tsvNumber(n.endSeconds),
+                    tsvNumber(n.durationSeconds),
+                    tsvNumber(n.bpm),
+                    tsvCell(n.lyric),
+                    n.vowel,
+                    n.kind,
+                    tsvCell(n.noteNumber)
+                ];
+            } else {
+                row = [
+                    n.index,
+                    tsvCell(n.section),
+                    tsvNumber(n.startTick),
+                    tsvNumber(n.endTick),
+                    tsvNumber(n.startSeconds),
+                    tsvNumber(n.endSeconds),
+                    tsvNumber(n.durationSeconds),
+                    tsvNumber(n.bpm),
+                    tsvCell(n.lyric),
+                    n.vowel,
+                    n.kind,
+                    tsvCell(n.noteNumber)
+                ];
+            }
             out.writeln(row.join("\t"));
         }
         out.close();
     }
 
-
-    // ---- 图形界面 --------------------------------------------------------
-
+    // UI
     function buildUI(thisObj) {
-        // 同时支持停靠面板与独立浮动面板。
         var win = (thisObj instanceof Panel)
             ? thisObj
             : new Window("palette", PANEL_TITLE, undefined, { resizeable: true });
@@ -741,7 +1441,6 @@
         win.spacing = 0;
         win.margins = 0;
 
-        // 将样板生成与口型生成分成两个选项卡，避免较长界面被窗口高度遮挡。
         var tabs = win.add("tabbedpanel");
         tabs.alignChildren = ["fill", "fill"];
         tabs.alignment = ["fill", "fill"];
@@ -759,7 +1458,6 @@
         ustTab.spacing = 8;
         ustTab.margins = 10;
 
-        // 样板合成：使用常见 AE 脚本的分组和对齐方式呈现尺寸参数。
         var sizePanel = templateTab.add("panel", undefined, "合成设置");
         sizePanel.orientation = "column";
         sizePanel.alignChildren = ["fill", "top"];
@@ -840,7 +1538,6 @@
         templateTab.add("statictext", undefined,
             "生成后可在合成中填入口型动画，再切换到“口型生成”。");
 
-        // UST 操作界面与样板设置分开显示，生成样板后自动切换至此选项卡。
         var filePanel = ustTab.add("panel", undefined, "UST 文件");
         filePanel.orientation = "column";
         filePanel.alignChildren = ["fill", "top"];
@@ -848,31 +1545,17 @@
         filePanel.margins = 10;
 
         var selectedUstFile = null;
+        var selectedUstxProject = null;
         var fileRow = filePanel.add("group");
         fileRow.orientation = "row";
         fileRow.alignChildren = ["center", "center"];
         fileRow.spacing = 8;
-        var selectedFileLabel = fileRow.add("statictext", undefined, "尚未选择 UST 文件");
+        var selectedFileLabel = fileRow.add("statictext", undefined, "尚未选择 UST/USTX 文件");
         selectedFileLabel.alignment = ["fill", "center"];
         selectedFileLabel.characters = 28;
-        selectedFileLabel.helpTip = "当前选择的 UST 文件名；将鼠标停留在此处可查看完整路径。";
+        selectedFileLabel.helpTip = "当前选择的文件名；将鼠标停留在此处可查看完整路径。";
         var chooseFileButton = fileRow.add("button", undefined, "选择…");
         chooseFileButton.preferredSize.width = 70;
-
-        function chooseUSTFile() {
-            var picked = File.openDialog("选择传统 UST 文件", "UST 文件:*.ust");
-            if (picked) {
-                selectedUstFile = picked;
-                selectedFileLabel.text = picked.name;
-                selectedFileLabel.helpTip = picked.fsName;
-                return true;
-            }
-            return false;
-        }
-
-        chooseFileButton.onClick = function () {
-            chooseUSTFile();
-        };
 
         var encodingRow = filePanel.add("group");
         encodingRow.orientation = "row";
@@ -885,7 +1568,92 @@
         ]);
         encodingChoice.selection = 0;
         encodingChoice.alignment = ["fill", "center"];
-        encodingChoice.helpTip = "传统 UST 通常使用 Shift-JIS；文件声明 UTF-8 时会优先按 UTF-8 读取。";
+        encodingChoice.helpTip = "传统 UST 通常使用 Shift-JIS；文件声明 UTF-8 时会优先按 UTF-8 读取。USTX 固定按 UTF-8 读取。";
+
+        var trackRow = filePanel.add("group");
+        trackRow.orientation = "row";
+        trackRow.alignChildren = ["center", "center"];
+        trackRow.spacing = 8;
+        trackRow.visible = false;
+        var trackLabel = trackRow.add("statictext", undefined, "轨道-歌手");
+        trackLabel.preferredSize.width = 70;
+        var trackChoice = trackRow.add("dropdownlist", undefined, []);
+        trackChoice.alignment = ["fill", "center"];
+        trackChoice.preferredSize.width = 285;
+        trackChoice.helpTip = "显示当前所选的轨道-歌手；应用口型时只处理当前轨道，导出 TSV 时仍会导出所有轨道。";
+        trackChoice.onChange = function () {
+            if (trackChoice.selection) {
+                trackChoice.helpTip = "当前所选项：" + trackChoice.selection.text +
+                    "。应用口型时只处理该轨道；导出 TSV 时仍会导出所有轨道。";
+            }
+        };
+
+        function refreshFilePanel() {
+            filePanel.layout.layout(true);
+            ustTab.layout.layout(true);
+            win.layout.layout(true);
+            win.layout.resize();
+        }
+
+        function fillUSTXTrackChoice(projectData) {
+            var i, item, selectedIndex = 0, foundDefault = false;
+            trackChoice.removeAll();
+            for (i = 0; i < projectData.tracks.length; i++) {
+                item = projectData.tracks[i];
+                trackChoice.add("item", item.trackName + " - " + item.singer);
+                if (!foundDefault && projectData.trackResults[i].notes.length > 0) {
+                    selectedIndex = i;
+                    foundDefault = true;
+                }
+            }
+            if (trackChoice.items.length > 0) {
+                trackChoice.selection = trackChoice.items[selectedIndex];
+                if (trackChoice.selection) {
+                    trackChoice.helpTip = "当前所选项：" + trackChoice.selection.text +
+                        "。应用口型时只处理该轨道；导出 TSV 时仍会导出所有轨道。";
+                }
+            }
+        }
+
+        function chooseUSTFile() {
+            var picked = File.openDialog("选择 UST 或 USTX 文件", "UST/USTX 文件:*.ust;*.ustx");
+            if (!picked) {
+                return false;
+            }
+            var isUstx = /\.ustx$/i.test(picked.name);
+            if (!isUstx && !/\.ust$/i.test(picked.name)) {
+                alert("请选择 .ust 或 .ustx 文件。", SCRIPT_NAME);
+                return false;
+            }
+
+            var parsedUstx = null;
+            if (isUstx) {
+                try {
+                    parsedUstx = parseUSTXFile(picked);
+                } catch (parseError) {
+                    alert("解析 USTX 时发生错误：\n" + parseError.toString(), SCRIPT_NAME);
+                    return false;
+                }
+            }
+
+            selectedUstFile = picked;
+            selectedUstxProject = parsedUstx;
+            selectedFileLabel.text = picked.name;
+            selectedFileLabel.helpTip = picked.fsName;
+            encodingRow.visible = !isUstx;
+            trackRow.visible = isUstx;
+            if (isUstx) {
+                fillUSTXTrackChoice(selectedUstxProject);
+            } else {
+                trackChoice.removeAll();
+            }
+            refreshFilePanel();
+            return true;
+        }
+
+        chooseFileButton.onClick = function () {
+            chooseUSTFile();
+        };
 
         var parseButton = ustTab.add("button", undefined, "导出.tsv文件");
         parseButton.alignment = ["fill", "top"];
@@ -895,9 +1663,17 @@
                 return;
             }
             try {
-                var result = parseUSTFile(selectedUstFile,
-                    encodingChoice.selection ? encodingChoice.selection.index : 0);
-                var outputFile = File.saveDialog("保存 UST 元音事件表", "TSV:*.tsv");
+                var result;
+                if (/\.ustx$/i.test(selectedUstFile.name)) {
+                    if (!selectedUstxProject) {
+                        selectedUstxProject = parseUSTXFile(selectedUstFile);
+                    }
+                    result = selectedUstxProject.exportResult;
+                } else {
+                    result = parseUSTFile(selectedUstFile,
+                        encodingChoice.selection ? encodingChoice.selection.index : 0);
+                }
+                var outputFile = File.saveDialog("保存元音事件表", "TSV:*.tsv");
                 if (!outputFile) {
                     return;
                 }
@@ -906,7 +1682,7 @@
                 }
                 writeEventTSV(outputFile, result);
             } catch (err) {
-                alert("解析 UST 时发生错误：\n" + err.toString(), SCRIPT_NAME);
+                alert("解析文件时发生错误：\n" + err.toString(), SCRIPT_NAME);
             }
         };
 
@@ -918,8 +1694,22 @@
                 return;
             }
             try {
-                var result = parseUSTFile(selectedUstFile,
-                    encodingChoice.selection ? encodingChoice.selection.index : 0);
+                var result;
+                if (/\.ustx$/i.test(selectedUstFile.name)) {
+                    if (!selectedUstxProject) {
+                        selectedUstxProject = parseUSTXFile(selectedUstFile);
+                    }
+                    if (!trackChoice.selection) {
+                        throw new Error("请先选择要应用的 USTX 轨道。");
+                    }
+                    result = selectedUstxProject.trackResults[trackChoice.selection.index];
+                    if (!result || result.notes.length === 0 || result.totalSeconds <= 0) {
+                        throw new Error("选中的轨道没有可用于生成口型的有效音符。");
+                    }
+                } else {
+                    result = parseUSTFile(selectedUstFile,
+                        encodingChoice.selection ? encodingChoice.selection.index : 0);
+                }
                 if (result.counts.unknown > 0) {
                     if (!confirm(
                         "检测到 " + result.counts.unknown + " 个未识别的歌词事件。\n" +
@@ -956,7 +1746,6 @@
             app.beginUndoGroup("创建口型样板合成");
             try {
                 createTemplate(width, height);
-                // 显示后续操作界面，避免用户误以为脚本只负责生成样板。
                 tabs.selection = ustTab;
                 win.layout.layout(true);
                 win.layout.resize();
