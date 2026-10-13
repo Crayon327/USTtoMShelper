@@ -3,7 +3,7 @@
 
 /*
  * USTtoMShelper - 口型样板、UST 解析与时间重映射
- * v0.8.0
+ * v0.9.0
  * 创建 7 秒口型样板，解析 UST/USTX，并根据所选轨道的日语元音生成时间重映射。
  */
 
@@ -142,30 +142,49 @@
         return ch;
     }
 
-    // 将歌词归类为 a/i/u/e/o、closed 或 unknown。
+    // 判断歌词是否以元音直接起始
+    function isOnsetlessLyric(lyric) {
+        var original = trimText(lyric);
+        var i, normalized = "", ch;
+
+        if (/^(ー|ｰ)+$/.test(original)) {
+            return true;
+        }
+        if (/^[aiueo]+$/i.test(original)) {
+            return true;
+        }
+
+        for (i = 0; i < original.length; i++) {
+            ch = toHiraganaChar(original.charAt(i));
+            normalized += ch;
+        }
+        return /^[あいうえおぁぃぅぇぉー]+$/.test(normalized);
+    }
+
+    // 将歌词归类为 a/i/u/e/o、closed 或 unknown
     function classifyLyric(lyric, previousVowel) {
         var original = trimText(lyric);
         var lower = original.toLowerCase();
         var tokens, lastToken, i, ch, hira, found = "", vowel;
 
         if (original === "" || /^(r|rest|sil|silence|pau|sp|cl|br)$/i.test(original)) {
-            return { vowel: "closed", kind: "rest", recognized: true };
+            return { vowel: "closed", kind: "rest", recognized: true, onsetless: false };
         }
         if (/^(っ|ッ)$/.test(original)) {
             // 促音沿用上一个有效元音
             if (previousVowel && /^[aiueo]$/.test(previousVowel)) {
-                return { vowel: previousVowel, kind: "sokuon", recognized: true };
+                return { vowel: previousVowel, kind: "sokuon", recognized: true, onsetless: false };
             }
-            return { vowel: "closed", kind: "sokuon", recognized: true };
+            return { vowel: "closed", kind: "sokuon", recognized: true, onsetless: false };
         }
         if (/^(ん|ン|n)$/i.test(original)) {
-            return { vowel: "closed", kind: "closure", recognized: true };
+            return { vowel: "closed", kind: "closure", recognized: true, onsetless: false };
         }
         if (/^(ー|ｰ)+$/.test(original)) {
             if (previousVowel && /^[aiueo]$/.test(previousVowel)) {
-                return { vowel: previousVowel, kind: "long", recognized: true };
+                return { vowel: previousVowel, kind: "long", recognized: true, onsetless: true };
             }
-            return { vowel: "unknown", kind: "unknown", recognized: false };
+            return { vowel: "unknown", kind: "unknown", recognized: false, onsetless: false };
         }
 
         // 拗音取最后一个假名
@@ -185,24 +204,24 @@
             }
         }
         if (/^[aiueo]$/.test(found)) {
-            return { vowel: found, kind: "kana", recognized: true };
+            return { vowel: found, kind: "kana", recognized: true, onsetless: isOnsetlessLyric(original) };
         }
         if (found === "closed") {
-            return { vowel: "closed", kind: "closure", recognized: true };
+            return { vowel: "closed", kind: "closure", recognized: true, onsetless: false };
         }
 
         // 无法识别假名时，尝试按常见罗马字别名的末尾元音判断，否则保留为 unknown
         tokens = lower.split(/\s+/);
         lastToken = tokens[tokens.length - 1];
         if (/^(r|rest|sil|silence|pau|sp|cl|br|n)$/.test(lastToken)) {
-            return { vowel: "closed", kind: "rest", recognized: true };
+            return { vowel: "closed", kind: "rest", recognized: true, onsetless: false };
         }
         var romanMatch = lastToken.match(/[aiueo]$/);
         if (romanMatch) {
             vowel = romanMatch[0];
-            return { vowel: vowel, kind: "alias", recognized: true };
+            return { vowel: vowel, kind: "alias", recognized: true, onsetless: isOnsetlessLyric(lastToken) };
         }
-        return { vowel: "unknown", kind: "unknown", recognized: false };
+        return { vowel: "unknown", kind: "unknown", recognized: false, onsetless: false };
     }
 
     // 时间计算
@@ -321,6 +340,7 @@
                 vowel: classified.vowel,
                 kind: classified.kind,
                 recognized: classified.recognized,
+                onsetless: classified.onsetless,
                 noteNumber: noteNumber
             });
 
@@ -919,6 +939,7 @@
                 vowel: classified.vowel,
                 kind: classified.kind,
                 recognized: classified.recognized,
+                onsetless: classified.onsetless,
                 noteNumber: raw.tone,
                 trackNo: track.trackNo,
                 trackName: track.trackName,
@@ -1111,7 +1132,7 @@
         return /^[aiueo]$/.test(note.vowel);
     }
 
-    // 合并相邻的同元音音符
+    // 仅合并后一个音符无辅音起始、时间连续且元音相同的音符
     function mergeContinuousSameVowelNotes(notes) {
         var merged = [];
         var i, note, current, key, copy, isContinuous;
@@ -1132,6 +1153,8 @@
                 current.vowel === copy.vowel &&
                 !current.isGap && !copy.isGap &&
                 !copy.startsAfterGap &&
+                copy.onsetless === true &&
+                current.kind !== "sokuon" && copy.kind !== "sokuon" &&
                 Math.abs(current.endSeconds - copy.startSeconds) <= epsilon;
 
             if (isContinuous) {
@@ -1345,6 +1368,7 @@
                 }
             }
 
+            // 音符内部使用线性插值，出点改用保持插值
             var planKey, outgoingInterpolation;
             for (k = 1; k <= remap.numKeys; k++) {
                 planKey = null;
